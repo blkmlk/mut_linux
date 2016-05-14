@@ -51,6 +51,13 @@ static inline int ip_mr_init(void)
 }
 #endif
 
+#ifdef CONFIG_IP_MUT
+struct mut_dst {
+	struct list_head list;
+	__be32 ip;
+};
+#endif
+
 struct vif_device {
 	struct net_device 	*dev;			/* Device we are using */
 	unsigned long	bytes_in,bytes_out;
@@ -70,6 +77,9 @@ struct mfc_cache {
 	__be32 mfc_origin;			/* Source of packet 		*/
 	vifi_t mfc_parent;			/* Source interface		*/
 	int mfc_flags;				/* Flags on line		*/
+#ifdef CONFIG_IP_MUT 
+	struct list_head mut_list;	/* Unicast destinations */
+#endif
 
 	union {
 		struct {

@@ -453,6 +453,15 @@ static struct ctl_table ipv4_table[] = {
 		.extra1		= &one
 	},
 #endif
+#ifdef CONFIG_IP_MUT
+	{
+		.procname	= "mut",
+		.data		= &sysctl_mut,
+		.maxlen		= sizeof(int),
+		.mode 		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+#endif
 	{
 		.procname	= "inet_peer_threshold",
 		.data		= &inet_peer_threshold,
