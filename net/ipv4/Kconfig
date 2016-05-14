@@ -223,6 +223,13 @@ config IP_MROUTE
 	  likely run the program mrouted. If you haven't heard about it, you
 	  don't need it.
 
+config IP_MUT
+	bool "IP: multicast to unicast"
+	depends on IP_MROUTE
+	help
+	  This is awesome addition for kernel. This makes you can transmit
+	  multicast packets to unicast.
+
 config IP_MROUTE_MULTIPLE_TABLES
 	bool "IP: multicast policy routing"
 	depends on IP_MROUTE && IP_ADVANCED_ROUTER

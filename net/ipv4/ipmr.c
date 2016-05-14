@@ -139,6 +139,10 @@ static void mroute_netlink_event(struct mr_table *mrt, struct mfc_cache *mfc,
 static void mroute_clean_tables(struct mr_table *mrt, bool all);
 static void ipmr_expire_process(unsigned long arg);
 
+#ifdef CONFIG_IP_MUT
+int sysctl_mut __read_mostly = 0; // 0 - disabled; >= 1 - enabled
+#endif
+
 #ifdef CONFIG_IP_MROUTE_MULTIPLE_TABLES
 #define ipmr_for_each_table(mrt, net) \
 	list_for_each_entry_rcu(mrt, &net->ipv4.mr_tables, list)
@@ -615,6 +619,19 @@ static inline void ipmr_cache_free(struct mfc_cache *c)
 	call_rcu(&c->rcu, ipmr_cache_free_rcu);
 }
 
+#ifdef CONFIG_IP_MUT
+static void ipmr_mut_dst_free_rcu(struct rcu_head *head)
+{
+	struct mut_dst *d = container_of(head, struct mut_dst, rcu);
+
+	kfree(d);
+}
+
+static inline void ipmr_mut_dst_free(struct mut_dst *d)
+{
+	call_rcu(&d->rcu, ipmr_mut_dst_free_rcu);
+}
+#endif
 /* Destroy an unresolved cache entry, killing queued skbs
  * and reporting error to netlink readers.
  */
@@ -1105,6 +1122,9 @@ static int ipmr_mfc_delete(struct mr_table *mrt, struct mfcctl *mfc, int parent)
 {
 	int line;
 	struct mfc_cache *c, *next;
+#ifdef CONFIG_IP_MUT
+	struct mut_dst *d;
+#endif
 
 	line = MFC_HASH(mfc->mfcc_mcastgrp.s_addr, mfc->mfcc_origin.s_addr);
 
@@ -1113,6 +1133,12 @@ static int ipmr_mfc_delete(struct mr_table *mrt, struct mfcctl *mfc, int parent)
 		    c->mfc_mcastgrp == mfc->mfcc_mcastgrp.s_addr &&
 		    (parent == -1 || parent == c->mfc_parent)) {
 			list_del_rcu(&c->list);
+#ifdef CONFIG_IP_MUT
+			list_for_each_entry(d, &c->mut_list, list) {
+				list_del_rcu(&d->list);
+				ipmr_mut_dst_free(d);
+			}
+#endif		
 			mroute_netlink_event(mrt, c, RTM_DELROUTE);
 			ipmr_cache_free(c);
 			return 0;
@@ -1168,6 +1194,10 @@ static int ipmr_mfc_add(struct net *net, struct mr_table *mrt,
 	if (!mrtsock)
 		c->mfc_flags |= MFC_STATIC;
 
+#ifdef CONFIG_IP_MUT
+	INIT_LIST_HEAD(&c->mut_list);
+#endif
+
 	list_add_rcu(&c->list, &mrt->mfc_cache_array[line]);
 
 	/*
@@ -1196,6 +1226,63 @@ static int ipmr_mfc_add(struct net *net, struct mr_table *mrt,
 	mroute_netlink_event(mrt, c, RTM_NEWROUTE);
 	return 0;
 }
+
+#ifdef CONFIG_IP_MUT
+static int ipmr_mut_add_dst(struct mr_table *mrt, struct mut_req *req)
+{
+	struct mfc_cache *c;
+	struct mut_dst *new_m_dst, *i;
+
+	c = ipmr_cache_find(mrt, req->origin.s_addr, req->group.s_addr);
+
+	if (c == NULL) {
+		return -ENOENT;
+	}
+
+	new_m_dst = kmalloc(sizeof(struct mut_dst), GFP_KERNEL);
+
+	if (new_m_dst == NULL) {
+		return -ENOMEM;
+	}
+
+	if (ipv4_is_multicast(req->destination.s_addr) || ipv4_is_lbcast(req->destination.s_addr)) {
+		return -EINVAL;
+	}
+
+	list_for_each_entry(i, &c->mut_list, list) {
+		if (req->destination.s_addr == i->ip) {
+			return 0;
+		}
+	}
+
+	new_m_dst->ip = req->destination.s_addr;
+
+	list_add_rcu(&new_m_dst->list, &c->mut_list);
+
+	return 0;
+}
+
+static int ipmr_mut_del_dst(struct mr_table *mrt, struct mut_req *req) {
+	struct mfc_cache *c;
+	struct mut_dst *d;
+
+	c = ipmr_cache_find(mrt, req->origin.s_addr, req->group.s_addr);
+
+	if (c == NULL) {
+		return -ENOENT;
+	}
+
+	list_for_each_entry(d, &c->mut_list, list) {
+		if (d->ip == req->destination.s_addr) {
+			list_del_rcu(&d->list);
+			kfree(d);
+			break;
+		}
+	}
+
+	return 0;
+}
+#endif
 
 /*
  *	Close the multicast socket, and clear the vif tables etc
@@ -1275,6 +1362,9 @@ int ip_mroute_setsockopt(struct sock *sk, int optname, char __user *optval, unsi
 	struct mfcctl mfc;
 	struct net *net = sock_net(sk);
 	struct mr_table *mrt;
+#ifdef CONFIG_IP_MUT
+	struct mut_req req;
+#endif
 
 	if (sk->sk_type != SOCK_RAW ||
 	    inet_sk(sk)->inet_num != IPPROTO_IGMP)
@@ -1357,6 +1447,23 @@ int ip_mroute_setsockopt(struct sock *sk, int optname, char __user *optval, unsi
 					   parent);
 		rtnl_unlock();
 		return ret;
+
+#ifdef CONFIG_IP_MUT
+	case MRT_MUT_ADD_DST:
+	case MRT_MUT_DEL_DST:
+		if (optlen != sizeof(struct mut_req))
+			return -EINVAL;
+		if (copy_from_user(&req, optval, sizeof(struct mut_req)))
+			return -EFAULT;
+
+		rtnl_lock();
+		if (optname == MRT_MUT_DEL_DST)
+			ret = ipmr_mut_del_dst(mrt, &req);
+		else
+			ret = ipmr_mut_add_dst(mrt, &req);
+		rtnl_unlock();
+		return ret;
+#endif
 		/*
 		 *	Control PIM assert.
 		 */
@@ -1788,6 +1895,37 @@ out_free:
 	kfree_skb(skb);
 }
 
+#ifdef CONFIG_IP_MUT
+static void ipmr_unicast_xmit(struct net *net, struct sk_buff *skb, struct mut_dst *m_dst)
+{
+	struct rtable *rt;
+	struct flowi4 fl4;
+	struct net_device *dev;
+	const struct iphdr *iph = ip_hdr(skb);
+
+	rt = ip_route_output_ports(net, &fl4, NULL, m_dst->ip, 0, 0, 0, IPPROTO_IPIP, RT_TOS(iph->tos), 0);
+
+	if (IS_ERR(rt))
+		goto out_free;
+
+	rt->rt_gateway = m_dst->ip;
+	dev = rt->dst.dev;
+
+	skb_dst_drop(skb);
+	skb_dst_set(skb, &rt->dst);
+	ip_decrease_ttl(ip_hdr(skb));
+
+	IPCB(skb)->flags |= IPSKB_FORWARDED;
+
+	NF_HOOK(NFPROTO_IPV4, NF_INET_FORWARD, skb, skb->dev, dev,
+		ipmr_forward_finish);
+	return;
+
+out_free:
+	kfree_skb(skb);
+}
+#endif
+
 static int ipmr_find_vif(struct mr_table *mrt, struct net_device *dev)
 {
 	int ct;
@@ -1884,6 +2022,9 @@ forward:
 		}
 		goto dont_forward;
 	}
+#ifdef CONFIG_IP_MUT
+	if (sysctl_mut == 0) {
+#endif
 	for (ct = cache->mfc_un.res.maxvif - 1;
 	     ct >= cache->mfc_un.res.minvif; ct--) {
 		/* For (*,G) entry, don't forward to the incoming interface */
@@ -1900,6 +2041,19 @@ forward:
 			psend = ct;
 		}
 	}
+#ifdef CONFIG_IP_MUT
+	} else {
+		struct mut_dst *m_dst;
+
+		list_for_each_entry_rcu(m_dst, &cache->mut_list, list) {
+			struct sk_buff *skb2 = skb_clone(skb, GFP_ATOMIC);
+
+			if (skb2) {
+				ipmr_unicast_xmit(net, skb2, m_dst);
+			}
+		}
+	}
+#endif
 last_forward:
 	if (psend != -1) {
 		if (local) {
@@ -2631,8 +2785,17 @@ static int ipmr_mfc_seq_show(struct seq_file *seq, void *v)
 	int n;
 
 	if (v == SEQ_START_TOKEN) {
+#ifdef CONFIG_IP_MUT
+		if (sysctl_mut == 0) {
+#endif
 		seq_puts(seq,
 		 "Group    Origin   Iif     Pkts    Bytes    Wrong Oifs\n");
+#ifdef CONFIG_IP_MUT
+		} else {
+			seq_puts(seq,
+			 "Group    Origin   Iif     Pkts    Bytes    Wrong Dsts\n");
+		}
+#endif
 	} else {
 		const struct mfc_cache *mfc = v;
 		const struct ipmr_mfc_iter *it = seq->private;
@@ -2648,6 +2811,9 @@ static int ipmr_mfc_seq_show(struct seq_file *seq, void *v)
 				   mfc->mfc_un.res.pkt,
 				   mfc->mfc_un.res.bytes,
 				   mfc->mfc_un.res.wrong_if);
+#ifdef CONFIG_IP_MUT
+			if (sysctl_mut == 0) {
+#endif
 			for (n = mfc->mfc_un.res.minvif;
 			     n < mfc->mfc_un.res.maxvif; n++) {
 				if (VIF_EXISTS(mrt, n) &&
@@ -2656,6 +2822,19 @@ static int ipmr_mfc_seq_show(struct seq_file *seq, void *v)
 					   " %2d:%-3d",
 					   n, mfc->mfc_un.res.ttls[n]);
 			}
+#ifdef CONFIG_IP_MUT
+			} else {
+				struct mut_dst *d;
+				unsigned int i = 0;
+
+				list_for_each_entry_rcu(d, &mfc->mut_list, list) {
+					if (i++ == 0) 
+						seq_printf(seq, " %08X\n", (__force u32) d->ip);
+					else
+						seq_printf(seq, "%48s %08X\n", " ", (__force u32) d->ip);
+				}
+			} 
+#endif
 		} else {
 			/* unresolved mfc_caches don't contain
 			 * pkt, bytes and wrong_if values

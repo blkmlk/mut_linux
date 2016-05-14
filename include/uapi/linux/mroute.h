@@ -28,7 +28,13 @@
 #define MRT_TABLE	(MRT_BASE+9)	/* Specify mroute table ID		*/
 #define MRT_ADD_MFC_PROXY	(MRT_BASE+10)	/* Add a (*,*|G) mfc entry	*/
 #define MRT_DEL_MFC_PROXY	(MRT_BASE+11)	/* Del a (*,*|G) mfc entry	*/
-#define MRT_MAX		(MRT_BASE+11)
+#ifdef CONFIG_IP_MUT
+#define MRT_MUT_ADD_DST (MRT_BASE+12)
+#define MRT_MUT_DEL_DST (MRT_BASE+13)
+#define MRT_MAX		(MRT_BASE+13)
+#else
+#define MRT_MAX 	(MRT_BASE+11)
+#endif
 
 #define SIOCGETVIFCNT	SIOCPROTOPRIVATE	/* IP protocol privates */
 #define SIOCGETSGCNT	(SIOCPROTOPRIVATE+1)
@@ -87,6 +93,14 @@ struct mfcctl {
 	unsigned int mfcc_wrong_if;
 	int	     mfcc_expire;
 };
+
+#ifdef CONFIG_IP_MUT
+struct mut_req {
+	struct in_addr group;			/* Group address */
+	struct in_addr origin;			/* Origin address */
+	struct in_addr destination;				/* unicast destination */
+};
+#endif
 
 /* 
  *	Group count retrieval for mrouted
